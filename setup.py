@@ -6,6 +6,7 @@ sdict = {
     'description' : 'Python/Twisted client for Redis key-value store',
     'url': 'http://ooici.net/packages/txredis/',
     'download_url' : 'http://ooici.net/packages/txredis/txredis-0.1.2.tar.gz',
+    'install_requires' : ['Twisted==10.1.0'],
     'author' : 'Dorian Raymer',
     'author_email' : 'deldotdr@gmail.com',
     'maintainer' : 'Dorian Raymer',
