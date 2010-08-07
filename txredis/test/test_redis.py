@@ -131,6 +131,8 @@ class General(CommandsTestBase):
         r = self.redis
         t = self.assertEqual
 
+        yield r.set('a', 1)
+
         a = yield r.rename('a', 'a')
         ex = ResponseError('source and destination objects are the same')
         t(str(a), str(ex))

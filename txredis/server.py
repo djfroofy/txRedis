@@ -4,6 +4,7 @@
 import struct
 import re
 import random
+from collections import deque
 
 from twisted.protocols.basic import LineOnlyReceiver, Int32StringReceiver
 from twisted.python import log
@@ -56,11 +57,20 @@ def P(_s_, _ns_):
     return Predicate(_truth_, _s_)
 
 
+def _same(something):
+    return something
 
 class Redis(LineOnlyReceiver, _SwitchableMixin):
     
     receiver = None
     database_no = 0
+
+    string_class = str
+    def string_factory(self, value):
+        return value
+    list_class = deque
+    def list_factory(self, value):
+        return deque(value)
 
     def connectionMade(self):
         debug('connection from client: %s' % self.transport)
@@ -97,8 +107,26 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
     recvd = property(_get_recvd, _set_recvd)
 
     def encodeValue(self, value):
+        if isinstance(value, self.string_class):
+            return [ str(value) ]
+        elif isinstance(value, self.list_class):
+            lines = []
+            lines.append('*%s' % len(value))
+            for v in value:
+                lines.append('$%s' % len(v))
+                lines.append(v)
+            print '@@@@ responding %r' % lines
+            return lines
+        return [ str(value) ]
+
+    def decodeValue(self, value):
         return value
 
+#        if isinstance(value, self.string_class):
+#            return self.string_factory(value)
+#        if isinstance(value, self.list_class):
+#            return str(self.list_factory(value))
+#        return self.string_factory(value)
 
     def _receiveInitial(self):
         while True:
@@ -272,12 +300,19 @@ class RedisFactory(Factory):
     protocol = Redis
     
     def __init__(self):
-        self.databases = [ {} for i in range(10) ]
+        self.databases = [ {} for i in range(100) ]
+        self.protocols = []
 
     def buildProtocol(self, addr):
         redis = Factory.buildProtocol(self, addr)
         redis.factory = self
+        redis.delayedCalls = {}
+        self.protocols.append(redis)
         return redis
+
+    def stopFactory(self):
+        for protocol in self.protocols:
+            protocol.transport.loseConnection()
 
  
 class BinaryStreamer(Int32StringReceiver):
@@ -344,9 +379,7 @@ class Token(object):
 
 
 class Evalable(object):
-
-    def eval(self, redis):
-        pass
+    pass
 
 class Command(Evalable, Token):
     parser = None
@@ -435,6 +468,8 @@ class KeyKeyCommand(KeyValueCommand):
     def key2(self):
         return self.value
 
+
+
 #class CommandSET(Command):
 #
 #    key = None
@@ -481,7 +516,7 @@ class CommandSET(KeyValueCommand):
     def eval(self, redis):
         print self, 'evaluating', redis
         database = redis.database
-        value = redis.encodeValue(self.value)
+        value = redis.decodeValue(self.value)
         print 'setting %s=%s' % (self.key, value)
         database[self.key] = value
         print 'done'
@@ -496,8 +531,13 @@ class CommandGET(KeyCommand):
         if value is NO_DATA:
             redis.sendLine('$-1')
         else:
-            redis.sendLine('$%s' % len(value))
-            redis.sendLine(value)
+            lines = redis.encodeValue(value)
+            if len(lines) == 1:
+                redis.sendLine('$%s' % len(lines[0]))
+            #redis.sendLine('$%s' % len(value))
+            #redis.sendLine(value)
+            for line in lines:
+                redis.sendLine(line)
         
 
 class CommandEXISTS(KeyCommand):
@@ -523,13 +563,18 @@ class CommandDEL(KeyCommand):
 class CommandTYPE(KeyCommand):
 
     def eval(self, redis):
-        redis.sendLine('+string')
+        if isinstance(self.key, redis.string_class):
+            redis.sendLine('+string')
+        elif isinstance(self.key, redis.list_class):
+            redis.sendLine('+list')
+        else:
+            redis.sendLine('+string')
 
 class CommandKEYS(KeyCommand):
 
     def eval(self, redis):
         pt = re.compile(self.key)
-        matches = [ k for k in redis.database.keys() if pt.match(self.key) ]
+        matches = [ k for k in redis.database.keys() if pt.match(k) ]
         data = ' '.join(matches)
         redis.sendLine('$%s' % len(data))
         redis.sendLine(data)
@@ -582,7 +627,7 @@ class CommandGETSET(KeyValueCommand):
     def eval(self, redis):
         print self, 'evaluating with', redis
         old_value = redis.database.get(self.key, NO_DATA)
-        value = redis.encodeValue(self.value)
+        value = redis.decodeValue(self.value)
         redis.database[self.key] = value
         if old_value == NO_DATA:
             redis.sendLine('$-1')
@@ -590,6 +635,25 @@ class CommandGETSET(KeyValueCommand):
             redis.sendLine('$%s' % len(old_value))
             redis.sendLine(old_value)
        
+class CommandEXPIRE(KeyValueCommand):
+
+    secondArgBytes = False
+
+    def eval(self, redis):
+        from twisted.internet import reactor
+        key = self.key
+        if not redis.database.has_key(key):
+            return redis.sendLine(':0')
+        def expire():
+            debug('expiring key: %s' % key)
+            redis.delayedCalls[self.key].remove(cl)
+            if not redis.delayedCalls[self.key]:
+                del redis.delayedCalls[self.key]
+            redis.database.pop(key, None)
+        cl = reactor.callLater(int(self.value), expire)
+        redis.delayedCalls.setdefault(self.key, []).append(cl)
+        redis.sendLine(':1')
+        
 
 class CommandRENAME(KeyKeyCommand):
 
@@ -598,15 +662,42 @@ class CommandRENAME(KeyKeyCommand):
     def eval(self, redis):
 
         if self.key1 == self.key2:
-            return redis.sendLine('-src and dest key are the same')
+            return redis.sendLine('-source and destination objects are the same')
 
         value = redis.database.pop(self.key1, NO_DATA)
         if value == NO_DATA:
-            redis.sendLine(':0')
+            redis.sendLine('-no such key')
         else:
-            value = redis.encodeValue(value)
+            value = redis.decodeValue(value)
             redis.database[self.key2] = value
             redis.sendLine('+OK') 
+
+class CommandRENAMENX(KeyKeyCommand):
+
+    secondArgBytes = False
+
+    def eval(self, redis):
+
+        if self.key1 == self.key2:
+            return redis.sendLine('-source and destination objects are the same')
+
+        value = redis.database.pop(self.key1, NO_DATA)
+        if value == NO_DATA:
+            return redis.sendLine('-no such key')
+        destvalue = redis.database.pop(self.key2, NO_DATA)
+        if destvalue != NO_DATA:
+            redis.database[self.key1] = value
+            return redis.sendLine(':0')
+        value = redis.decodeValue(value)
+        redis.database[self.key2] = value
+        redis.sendLine('+OK') 
+
+class CommandDBSIZE(NoArgsCommand):
+
+    def eval(self, redis):
+        data = str(len(redis.database))
+        redis.sendLine('$%d' % len(data))
+        redis.sendLine(data)
 
 
 #class IncrCommandMixin(object):
@@ -642,8 +733,71 @@ class CommandINCRBY(KeyValueCommand):
         redis.database[self.key] = value = str(int(value) + int(self.value))
         redis.sendLine(':%s' % value)
 
+class CommandAPPEND(KeyValueCommand):
 
-        
+    def eval(self, redis):
+        value = redis.database[self.key]
+        value += self.value
+        redis.sendLine(':%d' % len(value))
+
+
+class PushCommand(KeyValueCommand):
+    
+    pushMethod = None
+    secondArgBytes = True
+
+    def eval(self, redis):
+        lst = redis.database.setdefault(self.key, redis.list_factory([]))
+        if not isinstance(lst, redis.list_class):
+            redis.sendLine('-ERR wrong type for key')
+            return
+        method = getattr(lst, self.pushMethod)
+        method(self.value)
+        redis.sendLine('+OK')
+    
+
+class CommandLPUSH(PushCommand):
+    pushMethod = 'appendleft'
+
+class CommandRPUSH(PushCommand):
+    pushMethod = 'append'
+   
+class PopCommand(KeyCommand):
+    
+    popMethod = None
+
+    def eval(self, redis):
+        lst = redis.database.setdefault(self.key, redis.list_factory([]))
+        if not isinstance(lst, redis.list_class):
+            redis.sendLine('-ERR wrong type for key')
+            return
+        method = getattr(lst, self.popMethod)
+        value = method()
+        lines = redis.encodeValue(value)
+        if len(lines) == 1:
+            redis.sendLine('$%d' % len(lines[0]))
+        for line in lines:
+            redis.sendLine(line)
+ 
+class CommandLPOP(PopCommand):
+    popMethod = 'popleft'
+
+class CommandRPOP(PopCommand):
+    popMethod = 'pop'
+
+class CommandFLUSHDB(NoArgsCommand):
+
+    def eval(self, redis):
+        redis.factory.databases[redis.database_no] = {}
+        redis.sendLine('+OK')
+
+class CommandSAVE(NoArgsCommand):
+
+    def eval(self, redis):
+        redis.sendLine('+OK')
+
+CommandBGSAVE = CommandSAVE
+
 
 class ValueParser(Parser):
 
