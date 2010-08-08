@@ -229,6 +229,8 @@ class General(CommandsTestBase):
         r = self.redis
         t = self.assertEqual
 
+        yield r.set('a', 1)
+    
         a = yield r.ttl('a')
         ex = -1
         t(a, ex)

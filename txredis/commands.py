@@ -22,6 +22,7 @@ COMMANDS = (
     'expire',
     'ttl',
     'append',
+    'substr',
     'lpush', 
     'rpush',
     'llen',

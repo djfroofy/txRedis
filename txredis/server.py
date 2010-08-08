@@ -4,6 +4,8 @@
 import struct
 import re
 import random
+import time
+import math
 from collections import deque
 
 from twisted.protocols.basic import LineOnlyReceiver, Int32StringReceiver
@@ -457,6 +459,39 @@ class KeyValueCommand(KeyCommand):
         pr = self.parser.parser = self.commandParser
         self.parser = pr
 
+class KeyValueValueCommand(KeyValueCommand):
+    afterSetValue1 = None
+    afterSetValue2 = None
+    secondArgBytes = False
+        
+    def setInlineArgs(self, args):
+        if len(args) == 3:
+            self.key = args[0]
+            self.value1 = args[1]
+            self.value2 = args[2]
+        elif len(args)  == 0:
+            self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
+        else:
+            self.commandParser.parser = None
+            log.msg('Dunno how to handle these arguments: %s' % args)
+
+    def afterSetKey(self):
+        pr = self.parser.parser = ValueParser(1, self.setValue1)
+        self.parser = pr
+
+    def setValue1(self, values):
+        self.value1 = values[0].value
+        if self.afterSetValue1:
+            return self.afterSetValue1()
+        pr = self.parser.parser = ValueParser(1, self.setValue2)
+        self.parser = pr
+    
+    def setValue2(self, values):
+        self.value2 = values[0].value
+        if self.afterSetValue1:
+            return self.afterSetValue2()
+        pr = self.parser.parser = self.commandParser
+        self.parser = pr
 
 class KeyKeyCommand(KeyValueCommand):
 
@@ -563,9 +598,14 @@ class CommandDEL(KeyCommand):
 class CommandTYPE(KeyCommand):
 
     def eval(self, redis):
-        if isinstance(self.key, redis.string_class):
+        v = redis.database.get(self.key, NO_DATA)
+
+        if v == NO_DATA:
+            return redis.sendLine('+none')
+
+        if isinstance(v, redis.string_class):
             redis.sendLine('+string')
-        elif isinstance(self.key, redis.list_class):
+        elif isinstance(v, redis.list_class):
             redis.sendLine('+list')
         else:
             redis.sendLine('+string')
@@ -655,6 +695,24 @@ class CommandEXPIRE(KeyValueCommand):
         redis.sendLine(':1')
         
 
+class CommandTTL(KeyCommand):
+
+    def eval(self, redis):
+        key = self.key
+        if not redis.database.has_key(key):
+            return redis.sendLine(':-1')
+        calls = redis.delayedCalls.get(key, None)
+        if calls is not None:
+            exp = min( [ cl.getTime()  for cl in calls ] )
+            ttl = math.ceil(cl.getTime() - time.time())
+            if ttl >= 0:
+                redis.sendLine(':%d' % ttl)
+            else:
+                redis.sendLine(':-1')
+        else:
+            redis.sendLine(':-1')
+
+
 class CommandRENAME(KeyKeyCommand):
 
     secondArgBytes = False
@@ -672,6 +730,24 @@ class CommandRENAME(KeyKeyCommand):
             redis.database[self.key2] = value
             redis.sendLine('+OK') 
 
+
+class CommandMOVE(KeyValueCommand):
+
+    secondArgBytes = False
+
+    def eval(self, redis):
+
+        key = self.key
+        database_no = int(self.value)
+
+        value = redis.database.pop(key, NO_DATA)
+        if value == NO_DATA:
+            return redis.sendLine(':0')
+        dest_db = redis.factory.databases[database_no]
+        dest_db[key] = value
+        redis.sendLine(':1')
+
+
 class CommandRENAMENX(KeyKeyCommand):
 
     secondArgBytes = False
@@ -687,6 +763,7 @@ class CommandRENAMENX(KeyKeyCommand):
         destvalue = redis.database.pop(self.key2, NO_DATA)
         if destvalue != NO_DATA:
             redis.database[self.key1] = value
+            redis.database[self.key2] = destvalue
             return redis.sendLine(':0')
         value = redis.decodeValue(value)
         redis.database[self.key2] = value
@@ -740,6 +817,20 @@ class CommandAPPEND(KeyValueCommand):
         value += self.value
         redis.sendLine(':%d' % len(value))
 
+
+class CommandSUBSTR(KeyValueValueCommand):
+
+    def eval(self, redis):
+        start = int(self.value1)
+        stop = int(self.value2)
+        s = redis.database.get(self.key, NO_DATA)
+        if s == NO_DATA:
+            return redis.sendLine('$-1')
+#        start = len(s) % start
+#        stop = len(s) % stop
+        substr = s[start:stop]
+        redis.sendLine('$%d' % len(substr))
+        redis.sendLine(substr)
 
 class PushCommand(KeyValueCommand):
     
@@ -798,6 +889,22 @@ class CommandSAVE(NoArgsCommand):
 
 CommandBGSAVE = CommandSAVE
 
+
+class CommandINFO(NoArgsCommand):
+
+    def eval(self, redis):
+        version_key = 'redis_version'
+        version_value = '3000'
+        info = (
+            ('redis_version', 'txredis-0.1'),
+            ('connected_clients', '5000'),
+            ('conencted_slaves', '1000'),
+            ('used_memory', '3187'),
+            ('changes_since_last_save', '0')
+        )
+        kv = '\r\n'.join([ ('%s:%s' % (k, v)) for  (k, v) in info ])
+        redis.sendLine('$%d' % len(kv))
+        redis.sendLine(kv)
 
 class ValueParser(Parser):
 

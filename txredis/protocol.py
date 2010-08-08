@@ -242,7 +242,7 @@ class RedisBase(protocol.Protocol, policies.TimeoutMixin):
     def bulkDataReceived(self, data):
         """Bulk data response received."""
         self._bulk_length = None
-
+        
         # try to convert to int/float, otherwise treat as string
         try:
             if data is None:
