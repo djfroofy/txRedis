@@ -2,6 +2,7 @@
 COMMANDS = (
     'ping',
     'set',
+    'setnx',
     'get',
     'getset',
     'mget',

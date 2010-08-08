@@ -401,6 +401,23 @@ class NoArgsCommand(Command):
             self.commandParser.parser = self.commandParser
             self.parser = self.commandParser
 
+
+class VarArgsCommand(Command):
+
+    def setInlineArgs(self, args):
+        if len(args):
+            self.args = args
+            self.commandParser.parser = self.commandParser
+            self.parser = self.commandParser
+        else:
+            self.args = []
+            self.commandParser.parser = self.parser = ValueParser(1, self.setNext)
+
+    def setNext(self, args):
+        self.args.append(args[0].value)
+        pr = self.parser.parser = ValueParser(1, self.setNext)
+        self.parser = pr
+
 class _KeySetterMixin(object):
 
     afterSetKey = None
@@ -423,8 +440,6 @@ class KeyCommand(Command, _KeySetterMixin):
             #self.commandParser.parser
         elif len(args) == 0:
             self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
-
-
 
 
 class KeyValueCommand(KeyCommand):
@@ -505,47 +520,6 @@ class KeyKeyCommand(KeyValueCommand):
 
 
 
-#class CommandSET(Command):
-#
-#    key = None
-#    value = None
-#
-#    def setInlineArgs(self, args):
-#        if len(args) == 2:
-#            self.key = args[0]
-#            bytes = args[1]
-#            self.commandParser.parser = self.parser = ValueParser(1, self.setValue)
-#        if len(args) == 0:
-#            self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
-#        else:
-#            self.commandParser.parser = None
-#            log.msg('Dunno how to handle these arguments: %s' % args)
-#
-#    def setKey(self, keys):
-#        log.msg('(set key) got keys')
-#        self.key = keys[0].value
-#        pr = self.parser.parser = ValueParser(1, self.setValue)
-#        self.parser = pr
-#
-#    def setValue(self, values):
-#        self.value = values[0].value
-#        print '(set value)', self.value
-#        print 'command parser', self.commandParser
-#        pr = self.parser.parser = self.commandParser
-#        self.parser = pr
-#
-#    def eval(self, redis):
-#        print self, 'evaluating', redis
-#        database = redis.database
-#        value = redis.encodeValue(self.value)
-#        print 'setting %s=%s' % (self.key, value)
-#        database[self.key] = value
-#        print 'done'
-#        redis.sendLine('+OK')
-#    
-#    def __str__(self):
-#        return 'CommandSET(key=%s, value=%s)' % (self.key, self.value)
-
 class CommandSET(KeyValueCommand):
 
     def eval(self, redis):
@@ -557,6 +531,15 @@ class CommandSET(KeyValueCommand):
         print 'done'
         redis.sendLine('+OK')
 
+class CommandSETNX(KeyValueCommand):
+
+    def eval(self, redis):
+        v = redis.database.get(self.key, NO_DATA)
+        if v != NO_DATA:
+            return redis.sendLine(':0')
+        redis.database[self.key] = self.value
+        return redis.sendLine(':1')
+        
 
 class CommandGET(KeyCommand):
 
@@ -574,6 +557,23 @@ class CommandGET(KeyCommand):
             for line in lines:
                 redis.sendLine(line)
         
+class CommandMGET(VarArgsCommand):
+
+    def eval(self, redis):
+        redis.sendLine('*%d' % len(self.args))
+        for key in self.args:
+            v = redis.database.get(key, NO_DATA)
+            countSent = False
+            if v is NO_DATA:
+                redis.sendLine('$-1')
+            else:
+                lines = redis.encodeValue(v)
+                if len(lines) == 1:
+                    redis.sendLine('$%d' % len(lines[0]))
+                for line in lines:
+                    redis.sendLine(line)
+
+
 
 class CommandEXISTS(KeyCommand):
 
@@ -777,17 +777,6 @@ class CommandDBSIZE(NoArgsCommand):
         redis.sendLine(data)
 
 
-#class IncrCommandMixin(object):
-#    amount = 1
-#    
-#    def eval(self, redis):
-#        value = redis.database.get(self.key, '0')
-#        if not value.isdigit():
-#            redis.sendLine('-sorry haus')
-#            return
-#        redis.database[self.key] = value = str(int(value) + int(self.amount))
-#        redis.sendLine(':%s' % value)
-
 class CommandINCR(KeyCommand):
     
     def eval(self, redis):
@@ -822,7 +811,7 @@ class CommandSUBSTR(KeyValueValueCommand):
 
     def eval(self, redis):
         start = int(self.value1)
-        stop = int(self.value2)
+        stop = int(self.value2) + 1
         s = redis.database.get(self.key, NO_DATA)
         if s == NO_DATA:
             return redis.sendLine('$-1')
@@ -881,6 +870,35 @@ class CommandFLUSHDB(NoArgsCommand):
     def eval(self, redis):
         redis.factory.databases[redis.database_no] = {}
         redis.sendLine('+OK')
+
+class CommandLLEN(KeyCommand):
+
+    def eval(self, redis):
+        l = redis.database.get(self.key, NO_DATA)
+        if l == NO_DATA:
+            return redis.sendLine('$-1')
+        redis.sendLine(':%d' % len(l))
+
+class CommandLRANGE(KeyValueValueCommand):
+
+    def eval(self, redis):
+        dq = redis.database.get(self.key, NO_DATA)
+        key = self.key
+        start = int(self.value1)
+        stop = int(self.value2)
+        if stop > 0:
+            stop = stop + 1
+        if dq == NO_DATA:
+            return redis.sendLine('-sorry haus')
+        values = list(dq)[start:stop]
+        redis.sendLine('*%d' % len(values))
+        for v in values:
+            lines = redis.encodeValue(v)
+            if len(lines) == 1:
+                redis.sendLine('$%d' % len(lines[0]))
+            for line in lines:
+                redis.sendLine('%s' % line)
+
 
 class CommandSAVE(NoArgsCommand):
 
