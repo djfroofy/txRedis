@@ -221,8 +221,6 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
  
         pred = lambda s: P(s, lcs)
 
-
-
         bad = ( pred("not bytes") or
                 pred("bytes[0] != '%s'" % prefix) or
                 pred("not bytes[1:].isdigit()") )
@@ -306,11 +304,12 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
    
 class RedisFactory(Factory):
 
-    protocol = Redis
-    
+    protocol = Redis    
+
     def __init__(self):
         self.databases = [ {} for i in range(100) ]
         self.protocols = []
+        self.popQueues = [ {} for i in range(100) ]
 
     def buildProtocol(self, addr):
         redis = Factory.buildProtocol(self, addr)
@@ -318,6 +317,36 @@ class RedisFactory(Factory):
         redis.delayedCalls = {}
         self.protocols.append(redis)
         return redis
+
+    def listenPop(self, popMethod, databaseNo, protocol, keys, timeout):
+        from twisted.internet import reactor
+        entry = (protocol, popMethod, keys)
+        queues = self.popQueues[databaseNo]
+        for key in keys:
+            dq = queues.setdefault(key, deque())
+            dq.append(entry)
+        reactor.callLater(timeout, self.unlistenPop, popMethod, databaseNo, protocol, keys, True)
+
+    def unlistenPop(self, popMethod, databaseNo, protocol, keys, timeout=False):
+        entry = (protocol, popMethod, keys)
+        queues = self.popQueues[databaseNo]
+        for key in keys:
+            dq = queues.get(key, None)
+            if dq and entry in dq:
+                dq.remove(entry)
+        if timeout:
+            protocol.sendResponse(NO_DATA)
+
+    def notifyPush(self, key, lst, databaseNo): 
+        queues = self.popQueues[databaseNo]
+        q = queues.get(key, None)
+        if q:
+            protocol, popMethod, keys = q.popleft()
+            method = getattr(lst, popMethod)
+            value = method()
+            resp = protocol.list_factory([key, value])
+            self.unlistenPop(popMethod, databaseNo, protocol, keys)
+            protocol.sendResponse(resp)
 
     def stopFactory(self):
         for protocol in self.protocols:
@@ -483,6 +512,31 @@ class KeyValueValueCommand(KeyValueCommand):
         return self.args[2]
 
 
+class Expirational(object):
+
+    def expire(self, key, seconds, redis):
+        from twisted.internet import reactor
+        if not redis.database.has_key(key):
+            return 0#redis.sendResponse(0)
+        if seconds == 0:
+            timeouts = redis.delayedCalls.get(key, [])
+            for timeout in timeouts:
+                timeout.cancel()
+            redis.database.pop(key, None)
+            return 1#redis.sendResponse(1)
+        if redis.delayedCalls.has_key(key):
+            return 0#redis.sendResponse(0)
+        def expire():
+            debug('expiring key: %s' % key)
+            redis.delayedCalls[self.key].remove(cl)
+            if not redis.delayedCalls[self.key]:
+                del redis.delayedCalls[self.key]
+            redis.database.pop(key, None)
+        cl = reactor.callLater(seconds, expire)
+        redis.delayedCalls.setdefault(self.key, []).append(cl)
+        return 1#redis.sendResponse(1)
+        
+
 class CommandSET(KeyValueCommand):
 
     def respond(self, redis):
@@ -502,24 +556,37 @@ class CommandSETNX(KeyValueCommand):
         return redis.sendResponse(1)
         
 
-class CommandSETEX(KeyValueValueCommand):
+class CommandSETEX(KeyValueValueCommand, Expirational):
 
     def respond(self, redis): 
         database = redis.database
-        expiry = int(self.value2)
+        seconds = int(self.value2)
         value = redis.decodeValue(self.value1)
         key = self.key
         database[key] = value
-        def expire():
-            debug('expiring key: %s' % key)
-            redis.delayedCalls[self.key].remove(cl)
-            if not redis.delayedCalls[self.key]:
-                del redis.delayedCalls[self.key]
-            redis.database.pop(key, None)
-        cl = reactor.callLater(expiry, expire)
-        redis.delayedCalls.setdefault(self.key, []).append(cl)
+        self.expire(key, seconds, redis)
         redis.sendResponse(RESP_OK)
 
+
+class CommandMSET(VarArgsCommand):
+
+    def respond(self, redis):
+        for i in range(0, len(self.args), 2):
+            key, value = self.args[i:i+2]
+            redis.database[key] = redis.decodeValue(value)
+        redis.sendResponse(RESP_OK)
+
+class CommandMSETNX(VarArgsCommand):
+    
+    def respond(self, redis):
+        update = {}
+        for i in range(0, len(self.args), 2):
+            key, value = self.args[i:i+2]
+            if redis.database.has_key(key):
+                return redis.sendResponse(0)
+            update[key] = value
+        redis.database.update(update)
+        redis.sendResponse(1)
 
 class CommandGET(KeyCommand):
 
@@ -636,27 +703,18 @@ class CommandGETSET(KeyValueCommand):
             redis.sendResponse(old_value)
       
  
-class CommandEXPIRE(KeyValueCommand):
+class CommandEXPIRE(KeyValueCommand, Expirational):
 
     secondArgBytes = False
 
     def respond(self, redis):
-        from twisted.internet import reactor
         key = self.key
-        if not redis.database.has_key(key):
-            return redis.sendResponse(0)
-        if redis.delayedCalls.has_key(self.key):
-            return redis.sendResponse(0)
-        def expire():
-            debug('expiring key: %s' % key)
-            redis.delayedCalls[self.key].remove(cl)
-            if not redis.delayedCalls[self.key]:
-                del redis.delayedCalls[self.key]
-            redis.database.pop(key, None)
-        cl = reactor.callLater(int(self.value), expire)
-        redis.delayedCalls.setdefault(self.key, []).append(cl)
-        redis.sendResponse(1)
-        
+        seconds = int(self.value)
+        if self.expire(key, seconds, redis):
+            redis.sendResponse(1)
+        else:
+            redis.sendResponse(0)
+
 
 class CommandTTL(KeyCommand):
 
@@ -760,6 +818,26 @@ class CommandINCRBY(KeyValueCommand):
         redis.database[self.key] = value = str(int(value) + int(self.value))
         redis.sendResponse(int(value))
 
+class CommandDECR(KeyCommand):
+    
+    def respond(self, redis):
+        value = redis.database.get(self.key, '0')
+        if not value.isdigit():
+            return redis.sendLine('-ERR value is not an integer')
+        redis.database[self.key] = value = str(int(value) - 1)
+        redis.sendResponse(int(value))
+
+class CommandDECRBY(KeyValueCommand):
+
+    secondArgBytes = False
+    
+    def respond(self, redis):
+        value = redis.database.get(self.key, '0')
+        if not value.isdigit():
+            redis.sendLine('-ERR value is not an integer')
+            return
+        redis.database[self.key] = value = str(int(value) - int(self.value))
+        redis.sendResponse(int(value))
 
 class CommandAPPEND(KeyValueCommand):
 
@@ -800,6 +878,7 @@ class PushCommand(KeyValueCommand):
             return
         method = getattr(lst, self.pushMethod)
         method(self.value)
+        redis.factory.notifyPush(self.key, lst, redis.database_no)
         redis.sendResponse(len(lst))
     
 
@@ -827,6 +906,36 @@ class CommandLPOP(PopCommand):
     popMethod = 'popleft'
 
 class CommandRPOP(PopCommand):
+    popMethod = 'pop'
+
+
+class BlockingPopCommand(VarArgsCommand):
+    
+    popMethod = None
+    queuePrefix = ''
+
+    def respond(self, redis):
+        
+        keys = self.args[:-1]
+        timeout = int(self.args[-1])
+
+        for key in keys:
+            lst = redis.database.setdefault(key, redis.list_factory([]))
+            if not isinstance(lst, redis.list_class):
+                redis.sendLine('-ERR wrong type for key')
+                return
+            if len(lst):            
+                method = getattr(lst, self.popMethod)
+                value = method()
+                return redis.sendResponse(redis.list_factory([key, value])) 
+
+        redis.factory.listenPop(self.popMethod, redis.database_no, redis,  keys, timeout)
+
+class CommandBLPOP(BlockingPopCommand):
+    popMethod = 'popleft'
+
+
+class CommandBRPOP(BlockingPopCommand):
     popMethod = 'pop'
 
 

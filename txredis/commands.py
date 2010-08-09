@@ -7,6 +7,8 @@ COMMANDS = (
     'get',
     'getset',
     'mget',
+    'mset',
+    'msetnx',
     'incr',
     'incrby',
     'decr',
