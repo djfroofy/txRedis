@@ -162,14 +162,11 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
         while True:
             line = yield
 
-            print 'Got a line', line
-
             if line[0] == '*':
                 count = self._readLength(line, prefix='*')
                 if count is None:
                     return
                 self.receiver = self._receiveMultiBulk(count)
-                print 'now we have a receiver', self.receiver
                 debug('_receiveInitial switched receiver to %s' % self.receiver)
                 continue
 
@@ -188,7 +185,6 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
 
             parser = CommandParser()
             parsed = parser.parse(line)
-            print 'parsed', parsed
             if not parsed:
                 log.msg('_receiveInitial bad line: %s' % line)
                 self.sendLine('-you messed up haus: %s' % parsed.expression)
@@ -197,30 +193,25 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
             token = parsed.expression
             tokens = []
             while not isinstance(token, Stop):
-                print '%%%% ok the token is', token
                 if token.collect:
                     tokens.append(token)
                 old_parser = parser
                 parser = parser.switch()
-                print '%%%% ? switched', parser
                 if parser == old_parser:
                     break
                 yield
                 line = yield
                 parsed = parser.parse(line)
                 if not parsed:
-                    log.msg('%%%% _receiveInitial bad line: %s' % line)
                     self.sendLine('-you messed up haus: %s' % parsed.expression)
                     self.transport.loseConnection()
                     return
                 token = parsed.expression
-                print '%%%% got a token', token
                 if isinstance(token, Stop):
                     break
                 yield
-            print '%%%% here is my tokens', tokens
-            for token in tokens:
-                token.eval(self)
+            for command in tokens:
+                command.respond(self)
             yield
                 
 
@@ -307,7 +298,7 @@ class Redis(LineOnlyReceiver, _SwitchableMixin):
                 self.receiver = self._noop()
                 return
             debug('_evaluateMultiBulk evaluating command: %r' % command)
-            command.eval(self)
+            command.respond(self)
              
     def _noop(self, *p, **kw):
         x = yield
@@ -494,7 +485,7 @@ class KeyValueValueCommand(KeyValueCommand):
 
 class CommandSET(KeyValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         database = redis.database
         value = redis.decodeValue(self.value)
         database[self.key] = value
@@ -503,7 +494,7 @@ class CommandSET(KeyValueCommand):
 
 class CommandSETNX(KeyValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         v = redis.database.get(self.key, NO_DATA)
         if v != NO_DATA:
             return redis.sendResponse(0)
@@ -513,7 +504,7 @@ class CommandSETNX(KeyValueCommand):
 
 class CommandSETEX(KeyValueValueCommand):
 
-    def eval(self, redis): 
+    def respond(self, redis): 
         database = redis.database
         expiry = int(self.value2)
         value = redis.decodeValue(self.value1)
@@ -532,7 +523,7 @@ class CommandSETEX(KeyValueValueCommand):
 
 class CommandGET(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         value = redis.database.get(self.key, NO_DATA)
         if value is NO_DATA:
             redis.sendResponse(NO_DATA)
@@ -544,7 +535,7 @@ class CommandGET(KeyCommand):
  
 class CommandMGET(VarArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         vlist = redis.list_factory([])
         for key in self.args:
             vlist.append(redis.database.get(key, NO_DATA))
@@ -553,7 +544,7 @@ class CommandMGET(VarArgsCommand):
 
 class CommandEXISTS(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         exists = redis.database.has_key(self.key)
         if exists:
             redis.sendResponse(1)
@@ -563,7 +554,7 @@ class CommandEXISTS(KeyCommand):
 
 class CommandDEL(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         print self, 'evaluating with', redis
         value = redis.database.pop(self.key, NO_DATA)
         if value == NO_DATA:
@@ -573,7 +564,7 @@ class CommandDEL(KeyCommand):
     
 class CommandTYPE(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         v = redis.database.get(self.key, NO_DATA)
         if v == NO_DATA:
             return redis.sendLine('+none')
@@ -586,7 +577,7 @@ class CommandTYPE(KeyCommand):
 
 class CommandKEYS(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         pt = re.compile(self.key)
         matches = [ k for k in redis.database.keys() if pt.match(k) ]
         data = ' '.join(matches)
@@ -599,12 +590,12 @@ class CommandPING(Command):
         if len(args) == 0:
             self.commandParser.parser = self.commandParser
 
-    def eval(self, redis):
+    def respond(self, redis):
         redis.sendLine('+PONG')
 
 class CommandRANDOMKEY(NoArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         key = random.choice(redis.database.keys())
         self.sendResponse(key)
 
@@ -625,7 +616,7 @@ class CommandSELECT(Command):
         pr = self.parser.parser = self.commandParser
         self.parser = pr
 
-    def eval(self, redis):
+    def respond(self, redis):
         redis.database_no = self.database_no
         redis.sendResponse(RESP_OK)
 
@@ -635,7 +626,7 @@ class CommandSELECT(Command):
 
 class CommandGETSET(KeyValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         old_value = redis.database.get(self.key, NO_DATA)
         value = redis.decodeValue(self.value)
         redis.database[self.key] = value
@@ -649,7 +640,7 @@ class CommandEXPIRE(KeyValueCommand):
 
     secondArgBytes = False
 
-    def eval(self, redis):
+    def respond(self, redis):
         from twisted.internet import reactor
         key = self.key
         if not redis.database.has_key(key):
@@ -669,7 +660,7 @@ class CommandEXPIRE(KeyValueCommand):
 
 class CommandTTL(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         key = self.key
         if not redis.database.has_key(key):
             return redis.sendResponse(-1)
@@ -689,7 +680,7 @@ class CommandRENAME(KeyKeyCommand):
 
     secondArgBytes = False
 
-    def eval(self, redis):
+    def respond(self, redis):
 
         if self.key1 == self.key2:
             return redis.sendLine('-source and destination objects are the same')
@@ -707,7 +698,7 @@ class CommandMOVE(KeyValueCommand):
 
     secondArgBytes = False
 
-    def eval(self, redis):
+    def respond(self, redis):
 
         key = self.key
         database_no = int(self.value)
@@ -724,7 +715,7 @@ class CommandRENAMENX(KeyKeyCommand):
 
     secondArgBytes = False
 
-    def eval(self, redis):
+    def respond(self, redis):
 
         if self.key1 == self.key2:
             return redis.sendLine('-source and destination objects are the same')
@@ -744,13 +735,13 @@ class CommandRENAMENX(KeyKeyCommand):
 
 class CommandDBSIZE(NoArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         redis.sendResponse(len(redis.database))
 
 
 class CommandINCR(KeyCommand):
     
-    def eval(self, redis):
+    def respond(self, redis):
         value = redis.database.get(self.key, '0')
         if not value.isdigit():
             return redis.sendLine('-ERR value is not an integer')
@@ -761,7 +752,7 @@ class CommandINCRBY(KeyValueCommand):
 
     secondArgBytes = False
     
-    def eval(self, redis):
+    def respond(self, redis):
         value = redis.database.get(self.key, '0')
         if not value.isdigit():
             redis.sendLine('-ERR value is not an integer')
@@ -772,7 +763,7 @@ class CommandINCRBY(KeyValueCommand):
 
 class CommandAPPEND(KeyValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         value = redis.database[self.key]
         if not isinstance(value, redis.string_class):
             return redis.sendLine('-ERR Operation against a key holding the wrong kind of value')
@@ -782,7 +773,7 @@ class CommandAPPEND(KeyValueCommand):
 
 class CommandSUBSTR(KeyValueValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         start = int(self.value1)
         stop = int(self.value2)
         if stop > 0:
@@ -802,7 +793,7 @@ class PushCommand(KeyValueCommand):
     pushMethod = None
     secondArgBytes = True
 
-    def eval(self, redis):
+    def respond(self, redis):
         lst = redis.database.setdefault(self.key, redis.list_factory([]))
         if not isinstance(lst, redis.list_class):
             redis.sendLine('-ERR wrong type for key')
@@ -822,7 +813,7 @@ class PopCommand(KeyCommand):
     
     popMethod = None
 
-    def eval(self, redis):
+    def respond(self, redis):
         lst = redis.database.setdefault(self.key, redis.list_factory([]))
         if not isinstance(lst, redis.list_class):
             redis.sendLine('-ERR wrong type for key')
@@ -841,14 +832,14 @@ class CommandRPOP(PopCommand):
 
 class CommandFLUSHDB(NoArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         redis.factory.databases[redis.database_no] = {}
         redis.sendResponse(RESP_OK)
 
 
 class CommandLLEN(KeyCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         l = redis.database.get(self.key, NO_DATA)
         if l == NO_DATA:
             return redis.sendResponse(NO_DATA)
@@ -857,7 +848,7 @@ class CommandLLEN(KeyCommand):
 
 class CommandLRANGE(KeyValueValueCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         dq = redis.database.get(self.key, NO_DATA)
         key = self.key
         start = int(self.value1)
@@ -873,7 +864,7 @@ class CommandLRANGE(KeyValueValueCommand):
 
 class CommandSAVE(NoArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         redis.sendResponse(RESP_OK)
 
 CommandBGSAVE = CommandSAVE
@@ -881,7 +872,7 @@ CommandBGSAVE = CommandSAVE
 
 class CommandINFO(NoArgsCommand):
 
-    def eval(self, redis):
+    def respond(self, redis):
         version_key = 'redis_version'
         version_value = '3000'
         info = (
