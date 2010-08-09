@@ -411,6 +411,8 @@ class NoArgsCommand(Command):
 
 class VarArgsCommand(Command):
 
+    argCount = 1024
+
     def setInlineArgs(self, args):
         if len(args):
             self.args = args
@@ -422,107 +424,72 @@ class VarArgsCommand(Command):
 
     def setNext(self, args):
         self.args.append(args[0].value)
-        pr = self.parser.parser = ValueParser(1, self.setNext)
-        self.parser = pr
-
-class _KeySetterMixin(object):
-
-    afterSetKey = None
- 
-    def setKey(self, keys):
-        self.key = keys[0].value
-        if self.afterSetKey:
-            return self.afterSetKey()
-        pr = self.parser.parser = self.commandParser
-        self.parser = pr
-
-class KeyCommand(Command, _KeySetterMixin):
-    key = None
-
-    def setInlineArgs(self, args):
-        if len(args) == 1:
-            self.key = args[0]
-            self.commandParser.parser = self.parser = self.commandParser
-            #self.commandParser.parser
-        elif len(args) == 0:
-            self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
+        self.argCount -= 1
+        if self.argCount:
+            pr = self.parser.parser = ValueParser(1, self.setNext)
+            self.parser = pr
+        else: 
+            pr = self.parser.parser = self.commandParser
+            self.parser = pr
 
 
-class KeyValueCommand(KeyCommand):
+class KeyCommand(VarArgsCommand):
+    argCount = 1
 
-    afterSetValue = None
-    secondArgBytes = True
-        
-    def setInlineArgs(self, args):
-        if len(args) == 2 and self.secondArgBytes:
-            self.key = args[0]
-            bytes = args[1]
-            self.commandParser.parser = self.parser = ValueParser(1, self.setValue)
-        elif len(args) == 2:
-            self.key = args[0]
-            self.value = args[1]
-            self.commandParser.parser = self.commandParser
-            self.parser = self.commandParser
-        elif len(args)  == 0:
-            self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
-        else:
-            self.commandParser.parser = None
-            log.msg('Dunno how to handle these arguments: %s' % args)
+    @property
+    def key(self):
+        return self.args[0]
 
-    def afterSetKey(self):
-        pr = self.parser.parser = ValueParser(1, self.setValue)
-        self.parser = pr
-
-    def setValue(self, values):
-        self.value = values[0].value
-        if self.afterSetValue:
-            return self.afterSetValue()
-        pr = self.parser.parser = self.commandParser
-        self.parser = pr
-
-class KeyValueValueCommand(KeyValueCommand):
-    afterSetValue1 = None
-    afterSetValue2 = None
-    secondArgBytes = False
-        
-    def setInlineArgs(self, args):
-        if len(args) == 3:
-            self.key = args[0]
-            self.value1 = args[1]
-            self.value2 = args[2]
-        elif len(args)  == 0:
-            self.commandParser.parser = self.parser = ValueParser(1, self.setKey)
-        else:
-            self.commandParser.parser = None
-            log.msg('Dunno how to handle these arguments: %s' % args)
-
-    def afterSetKey(self):
-        pr = self.parser.parser = ValueParser(1, self.setValue1)
-        self.parser = pr
-
-    def setValue1(self, values):
-        self.value1 = values[0].value
-        if self.afterSetValue1:
-            return self.afterSetValue1()
-        pr = self.parser.parser = ValueParser(1, self.setValue2)
-        self.parser = pr
-    
-    def setValue2(self, values):
-        self.value2 = values[0].value
-        if self.afterSetValue1:
-            return self.afterSetValue2()
-        pr = self.parser.parser = self.commandParser
-        self.parser = pr
-
-class KeyKeyCommand(KeyValueCommand):
+class KeyKeyCommand(VarArgsCommand):
+    argCount = 2
 
     @property
     def key1(self):
-        return self.key
+        return self.args[0]
 
     @property
     def key2(self):
-        return self.value
+        return self.args[1]
+
+
+class KeyValueCommand(KeyCommand):
+    argCount = 2
+    secondArgBytes = True
+
+    def setInlineArgs(self, args):
+        if len(args) == 2 and self.secondArgBytes:
+            self.args = [ args[0] ]
+            self.argCount -= 1
+            bytes = args[1]
+            self.commandParser.parser = self.parser = ValueParser(1, self.setNext)
+        elif len(args) == self.argCount:
+            self.args = args
+            self.argCount -= 2
+            self.commandParser.parser = self.commandParser
+            self.parser = self.commandParser
+        elif len(args)  == 0:
+            self.args = []
+            self.commandParser.parser = self.parser = ValueParser(1, self.setNext)
+        else:
+            self.commandParser.parser = None
+            log.msg('Dunno how to handle these arguments: %s' % args)
+
+    @property
+    def value(self):
+        return self.args[1]
+
+
+class KeyValueValueCommand(KeyValueCommand):
+    argCount = 3
+    secondArgBytes = False
+
+    @property
+    def value1(self):
+        return self.args[1]
+
+    @property
+    def value2(self):
+        return self.args[2]
 
 
 class CommandSET(KeyValueCommand):
@@ -688,7 +655,7 @@ class CommandTTL(KeyCommand):
         calls = redis.delayedCalls.get(key, None)
         if calls is not None:
             exp = min( [ cl.getTime()  for cl in calls ] )
-            ttl = math.ceil(cl.getTime() - time.time())
+            ttl = int(math.ceil(cl.getTime() - time.time()))
             if ttl >= 0:
                 redis.sendResponse(ttl)
             else:
