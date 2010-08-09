@@ -511,6 +511,25 @@ class CommandSETNX(KeyValueCommand):
         return redis.sendResponse(1)
         
 
+class CommandSETEX(KeyValueValueCommand):
+
+    def eval(self, redis): 
+        database = redis.database
+        expiry = int(self.value2)
+        value = redis.decodeValue(self.value1)
+        key = self.key
+        database[key] = value
+        def expire():
+            debug('expiring key: %s' % key)
+            redis.delayedCalls[self.key].remove(cl)
+            if not redis.delayedCalls[self.key]:
+                del redis.delayedCalls[self.key]
+            redis.database.pop(key, None)
+        cl = reactor.callLater(expiry, expire)
+        redis.delayedCalls.setdefault(self.key, []).append(cl)
+        redis.sendResponse(RESP_OK)
+
+
 class CommandGET(KeyCommand):
 
     def eval(self, redis):
@@ -634,6 +653,8 @@ class CommandEXPIRE(KeyValueCommand):
         from twisted.internet import reactor
         key = self.key
         if not redis.database.has_key(key):
+            return redis.sendResponse(0)
+        if redis.delayedCalls.has_key(self.key):
             return redis.sendResponse(0)
         def expire():
             debug('expiring key: %s' % key)
